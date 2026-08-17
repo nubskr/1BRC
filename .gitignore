@@ -1,0 +1,7 @@
+.cache/
+.zig-cache/
+zig-out/
+
+measurements.txt
+measurements-*.7z.*
+perf.data*
