@@ -5,10 +5,10 @@ const _1brc = @import("1brc");
 const measurements_path = "./measurements.txt";
 
 const Stats = struct {
-    min: f64,
-    sum: f64,
-    max: f64,
-    count: u64,
+    min: i64,
+    sum: i64,
+    max: i64,
+    count: i64,
 };
 
 // <station> -> Stats{}
@@ -31,7 +31,9 @@ pub fn main(init: std.process.Init) !void {
     // var idx: usize = 0;
     while (try reader_interface.takeDelimiter('\n')) |line| {
         const station, const temperature_bytes = std.mem.cutScalar(u8, line, ';').?;
-        const temperature = try std.fmt.parseFloat(f64, temperature_bytes);
+        const temperature = parseTemperature(temperature_bytes);
+        // _ = temperature_bytes;
+        // const temperature = 0;
 
         const result = try map.getOrPut(arena, station);
         const val = result.value_ptr;
@@ -70,14 +72,19 @@ pub fn main(init: std.process.Init) !void {
 
     var first: bool = true;
     while (iterator.next()) |station| {
-        const float_count: f64 = @floatFromInt(station.value_ptr.count);
-        const avg: f64 = station.value_ptr.sum / float_count;
+        const float_count: f64 = @floatFromInt(station.value_ptr.count * 10);
+        const float_sum: f64 = @floatFromInt(station.value_ptr.sum);
+        const float_min: f64 = @as(f64, @floatFromInt(station.value_ptr.*.min)) / 10.0;
+        const float_max: f64 = @as(f64, @floatFromInt(station.value_ptr.*.max)) / 10.0;
+        const avg: f64 = float_sum / float_count;
+
+        // const avg: f64 = @divExact(station.value_ptr.sum, station.value_ptr.count);
 
         if (!first) try writer_interface.writeAll(", ");
 
         first = false;
 
-        try writer_interface.print("{s}={d:.1}/{d:.1}/{d:.1}", .{ station.key_ptr.*, station.value_ptr.*.min, avg, station.value_ptr.*.max });
+        try writer_interface.print("{s}={d:.1}/{d:.1}/{d:.1}", .{ station.key_ptr.*, float_min, avg, float_max });
 
         // std.debug.print("station: {s} | stats: {any} | avg: {d}\n", .{ station.key_ptr.*, station.value_ptr.*, avg });
     }
@@ -108,4 +115,15 @@ test "does this work?" {
     std.crypto.hash.sha2.Sha256.hash(file, &verification_hash, .{});
 
     try std.testing.expectEqual(our_hash, verification_hash);
+}
+
+fn parseTemperature(text: []const u8) i64 {
+    var ret: i64 = 0;
+    const neg: i8 = @intFromBool(text[0] == '-');
+    for (text[@as(usize, @intCast(neg))..]) |byte| {
+        if (byte != '.') ret = (ret * 10) + (byte - '0');
+    }
+
+    // weird ik, but just wanted to avoid an avoidable branch
+    return ret * (1 - 2 * @as(i64, @intFromBool(text[0] == '-')));
 }
