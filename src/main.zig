@@ -23,13 +23,25 @@ pub fn main(init: std.process.Init) !void {
     const file = try Io.Dir.cwd().openFile(io, measurements_path, .{});
     defer file.close(io);
 
-    var reader_buf: [6 * 1024]u8 = undefined;
-    var reader = file.reader(io, &reader_buf);
+    const yo = try file.stat(io);
+    // const po = yo.size;
+    const measurements = try std.posix.mmap(
+        null,
+        yo.size,
+        .{ .READ = true },
+        .{ .TYPE = .PRIVATE },
+        file.handle,
+        0,
+    );
 
-    const reader_interface = &reader.interface;
+    // invalidate shit i guess
+    defer std.posix.munmap(measurements);
+
+    var it = std.mem.splitScalar(u8, measurements, '\n');
 
     // var idx: usize = 0;
-    while (try reader_interface.takeDelimiter('\n')) |line| {
+    while (it.next()) |line| {
+        if (line.len == 0) break;
         const station, const temperature_bytes = std.mem.cutScalar(u8, line, ';').?;
         const temperature = parseTemperature(temperature_bytes);
         // _ = temperature_bytes;
@@ -47,11 +59,6 @@ pub fn main(init: std.process.Init) !void {
             result.key_ptr.* = try arena.dupe(u8, station);
             val.* = .{ .count = 1, .min = temperature, .max = temperature, .sum = temperature };
         }
-
-        // idx += 1;
-
-        // std.debug.print("station: {s} | temp: {d}", .{ station, temperature });
-        // if (idx >= 10) break;
     }
 
     const SortCtx = struct {
