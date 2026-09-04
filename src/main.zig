@@ -11,20 +11,27 @@ const Stats = struct {
     count: i64,
 };
 
+const morsel_count: usize = 128;
+const thread_count: usize = 16;
+
+var morsels: [morsel_count]Morsel = undefined;
+var morsel_ready_idx = std.atomic.Value(usize).init(0);
+
+const Morsel = struct { start: usize, end: usize };
+
 // <station> -> Stats{}
 
 pub fn main(init: std.process.Init) !void {
-    // _ = init;
     const io = init.io;
     const arena = init.arena.allocator();
 
     var map: std.StringArrayHashMapUnmanaged(Stats) = .empty;
+    try map.ensureTotalCapacity(arena, 10000);
 
     const file = try Io.Dir.cwd().openFile(io, measurements_path, .{});
     defer file.close(io);
 
     const yo = try file.stat(io);
-    // const po = yo.size;
     const measurements = try std.posix.mmap(
         null,
         yo.size,
@@ -33,31 +40,51 @@ pub fn main(init: std.process.Init) !void {
         file.handle,
         0,
     );
-
-    // invalidate shit i guess
     defer std.posix.munmap(measurements);
 
-    var it = std.mem.splitScalar(u8, measurements, '\n');
+    var start: usize = 0;
+    const chunk_size = measurements.len / morsel_count;
+    for (0..morsel_count) |i| {
+        var end = @min(measurements.len, start + chunk_size);
+        const wut = std.mem.indexOfScalar(u8, measurements[end..], '\n') orelse 0;
 
-    // var idx: usize = 0;
-    while (it.next()) |line| {
-        if (line.len == 0) break;
-        const station, const temperature_bytes = std.mem.cutScalar(u8, line, ';').?;
-        const temperature = parseTemperature(temperature_bytes);
-        // _ = temperature_bytes;
-        // const temperature = 0;
+        end += wut;
+        morsels[i] = .{ .start = start, .end = end };
+        start = end + 1;
 
-        const result = try map.getOrPut(arena, station);
-        const val = result.value_ptr;
+        // std.debug.print("idk man: {c}\n", .{measurements[end..][wut]});
+    }
 
-        if (result.found_existing) {
-            val.count += 1;
-            val.sum += temperature;
-            val.max = @max(val.max, temperature);
-            val.min = @min(val.min, temperature);
-        } else {
-            result.key_ptr.* = try arena.dupe(u8, station);
-            val.* = .{ .count = 1, .min = temperature, .max = temperature, .sum = temperature };
+    // std.debug.print("measuments size: {d} | morsels are: {any}\n", .{ measurements.len, morsels });
+
+    var threads: [thread_count]std.Thread = undefined;
+    var maps: [thread_count]std.StringArrayHashMapUnmanaged(Stats) = undefined;
+
+    for (0..thread_count) |i| {
+        maps[i] = .empty;
+        try map.ensureTotalCapacity(arena, 10000);
+        threads[i] = try std.Thread.spawn(.{}, process, .{ arena, &maps[i], measurements });
+    }
+
+    // join threads and merge the maps into big map
+    for (0..thread_count) |i| {
+        threads[i].join();
+
+        var iterator = maps[i].iterator();
+
+        while (iterator.next()) |entry| {
+            const idk = try map.getOrPut(arena, entry.key_ptr.*);
+
+            if (idk.found_existing) {
+                const my_value = entry.value_ptr.*;
+                const val = idk.value_ptr;
+                val.count += my_value.count;
+                val.sum += my_value.sum;
+                val.max = @max(val.max, my_value.max);
+                val.min = @min(val.min, my_value.min);
+            } else {
+                idk.value_ptr.* = entry.value_ptr.*;
+            }
         }
     }
 
@@ -85,15 +112,11 @@ pub fn main(init: std.process.Init) !void {
         const float_max: f64 = @as(f64, @floatFromInt(station.value_ptr.*.max)) / 10.0;
         const avg: f64 = float_sum / float_count;
 
-        // const avg: f64 = @divExact(station.value_ptr.sum, station.value_ptr.count);
-
         if (!first) try writer_interface.writeAll(", ");
 
         first = false;
 
         try writer_interface.print("{s}={d:.1}/{d:.1}/{d:.1}", .{ station.key_ptr.*, float_min, avg, float_max });
-
-        // std.debug.print("station: {s} | stats: {any} | avg: {d}\n", .{ station.key_ptr.*, station.value_ptr.*, avg });
     }
     try writer_interface.writeAll("}\n");
     try writer_interface.flush();
@@ -134,3 +157,52 @@ fn parseTemperature(text: []const u8) i64 {
     // weird ik, but just wanted to avoid an avoidable branch
     return ret * (1 - 2 * @as(i64, @intFromBool(text[0] == '-')));
 }
+
+/// okay, so what does this guy needs ?
+/// each core needs its own map
+/// so: map,measurements, morsel
+fn process(
+    arena: std.mem.Allocator,
+    map: *std.StringArrayHashMapUnmanaged(Stats),
+    measurements: []u8,
+) !void {
+    while (true) {
+        // get the morsel
+        const idx = morsel_ready_idx.fetchAdd(1, .monotonic);
+        if (idx >= morsel_count) {
+            break;
+        }
+
+        const morsel = morsels[idx];
+
+        var it = std.mem.splitScalar(u8, measurements[morsel.start..morsel.end], '\n');
+
+        while (it.next()) |line| {
+            if (line.len == 0) break;
+            const station, const temperature_bytes = std.mem.cutScalar(u8, line, ';').?;
+            const temperature = parseTemperature(temperature_bytes);
+
+            const result = try map.getOrPut(arena, station);
+            const val = result.value_ptr;
+
+            if (result.found_existing) {
+                val.count += 1;
+                val.sum += temperature;
+                val.max = @max(val.max, temperature);
+                val.min = @min(val.min, temperature);
+            } else {
+                result.key_ptr.* = try arena.dupe(u8, station);
+                val.* = .{ .count = 1, .min = temperature, .max = temperature, .sum = temperature };
+            }
+        }
+    }
+}
+
+// how the hell do we merge those maps darn it
+// just be a brute
+
+// so the whole game plan is that we:
+// - basically pre determine morsel boundaries
+// - then just let threads consume them at their own pace
+
+// now we need the merge logic so we can use multiple threads
