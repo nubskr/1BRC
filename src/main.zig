@@ -11,8 +11,8 @@ const Stats = struct {
     count: i64,
 };
 
-const morsel_count: usize = 128;
-const thread_count: usize = 16;
+const morsel_count: usize = 56;
+const thread_count: usize = 14;
 
 var morsels: [morsel_count]Morsel = undefined;
 var morsel_ready_idx = std.atomic.Value(usize).init(0);
@@ -62,7 +62,7 @@ pub fn main(init: std.process.Init) !void {
 
     for (0..thread_count) |i| {
         maps[i] = .empty;
-        try map.ensureTotalCapacity(arena, 10000);
+        try maps[i].ensureTotalCapacity(arena, 10000);
         threads[i] = try std.Thread.spawn(.{}, process, .{ arena, &maps[i], measurements });
     }
 
@@ -191,7 +191,7 @@ fn process(
                 val.max = @max(val.max, temperature);
                 val.min = @min(val.min, temperature);
             } else {
-                result.key_ptr.* = try arena.dupe(u8, station);
+                result.key_ptr.* = station;
                 val.* = .{ .count = 1, .min = temperature, .max = temperature, .sum = temperature };
             }
         }
