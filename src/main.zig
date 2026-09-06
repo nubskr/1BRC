@@ -12,7 +12,7 @@ const Stats = struct {
 };
 
 const morsel_count: usize = 56;
-const thread_count: usize = 14;
+const thread_count: usize = 16;
 
 var morsels: [morsel_count]Morsel = undefined;
 var morsel_ready_idx = std.atomic.Value(usize).init(0);
@@ -148,14 +148,11 @@ test "does this work?" {
 }
 
 fn parseTemperature(text: []const u8) i64 {
-    var ret: i64 = 0;
-    const neg: i8 = @intFromBool(text[0] == '-');
-    for (text[@as(usize, @intCast(neg))..]) |byte| {
-        if (byte != '.') ret = (ret * 10) + (byte - '0');
-    }
-
-    // weird ik, but just wanted to avoid an avoidable branch
-    return ret * (1 - 2 * @as(i64, @intFromBool(text[0] == '-')));
+    const is_neg: usize = @intFromBool(text[0] == '-');
+    const has_two_integers: i64 = @intFromBool(text.len - is_neg == 4);
+    const ret: i64 = @as(i64, @as(i64, (text[text.len - 1] - '0') + 10 * @as(i64, (text[text.len - 3] - '0'))) + has_two_integers * 100 * @as(i64, (text[is_neg] - '0')));
+    if (is_neg == 1) return -ret;
+    return ret;
 }
 
 /// okay, so what does this guy needs ?
