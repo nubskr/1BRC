@@ -147,6 +147,24 @@ test "does this work?" {
     try std.testing.expectEqual(our_hash, verification_hash);
 }
 
+fn parseTemperatureFast(text: []const u8, semicolon: usize) i64 {
+    const ayo = text[semicolon + 1 ..][0..8];
+    const num = std.mem.readInt(u64, ayo, .little);
+    // get location for '.'
+    const decimal_bit: u64 = @as(u64, @intCast(@ctz(~num & 0x10101000))) >> 3;
+    const is_neg = (~num >> 4) & 1;
+    const has_two_integers = (decimal_bit - is_neg - 1);
+    const tenth: i64 = @intCast((num >> @intCast((decimal_bit - 1) * 8)) & 0x0F);
+    const fraction: i64 = @intCast((num >> @intCast((decimal_bit + 1) * 8)) & 0x0F);
+    const potentially_hundreth: i64 = @intCast((num >> @intCast(is_neg * 8)) & 0x0F);
+    const ret: i64 =
+        tenth * 10 +
+        fraction +
+        @as(i64, @intCast(has_two_integers)) * 100 *
+            potentially_hundreth;
+    return ret * (1 - 2 * @as(i64, @intCast(is_neg)));
+}
+
 fn parseTemperature(text: []const u8) i64 {
     const is_neg: usize = @intFromBool(text[0] == '-');
     const has_two_integers: i64 = @intFromBool(text.len - is_neg == 4);
@@ -177,8 +195,16 @@ fn process(
         while (it.next()) |line| {
             if (line.len == 0) break;
             const station, const temperature_bytes = std.mem.cutScalar(u8, line, ';').?;
-            const temperature = parseTemperature(temperature_bytes);
-
+            // const temperature = parseTemperature(temperature_bytes);
+            var temperature: i64 = undefined;
+            const semicolon = @intFromPtr(temperature_bytes.ptr) -
+                @intFromPtr(measurements.ptr) - 1;
+            if (semicolon <= measurements.len - 9) {
+                @branchHint(.likely);
+                temperature = parseTemperatureFast(measurements, semicolon);
+            } else {
+                temperature = parseTemperature(temperature_bytes);
+            }
             const result = try map.getOrPut(arena, station);
             const val = result.value_ptr;
 
@@ -195,6 +221,19 @@ fn process(
     }
 }
 
+fn parseTemperatureFast_old(text: []const u8, semicolon: usize) i64 {
+    const ayo = text[semicolon + 1 ..][0..8];
+    const num = std.mem.readInt(u64, ayo, .little);
+    const decimal_bit: u64 = @as(u64, @intCast(@ctz(~num & 0x10101000))) >> 3;
+    const is_neg = (~num >> 4) & 1;
+    const has_two_integers = (decimal_bit - is_neg - 1);
+    const ret: i64 =
+        @as(i64, ayo[decimal_bit - 1] - '0') * 10 +
+        @as(i64, ayo[decimal_bit + 1] - '0') +
+        @as(i64, @intCast(has_two_integers)) * 100 *
+            @as(i64, ayo[is_neg] - '0');
+    return ret * (1 - 2 * @as(i64, @intCast(is_neg)));
+}
 // how the hell do we merge those maps darn it
 // just be a brute
 
