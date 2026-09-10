@@ -11,10 +11,11 @@ const Stats = struct {
     count: i64,
 };
 
-const morsel_count: usize = 56;
-const thread_count: usize = 16;
+const MORSEL_COUNT: usize = 56;
+const THREAD_COUNT: usize = 16;
+const RAW_CHUNK_SIZE: usize = 64;
 
-var morsels: [morsel_count]Morsel = undefined;
+var morsels: [MORSEL_COUNT]Morsel = undefined;
 var morsel_ready_idx = std.atomic.Value(usize).init(0);
 
 const Morsel = struct { start: usize, end: usize };
@@ -42,9 +43,13 @@ pub fn main(init: std.process.Init) !void {
     );
     defer std.posix.munmap(measurements);
 
+    const chunk = measurements[0..RAW_CHUNK_SIZE];
+    _ = chunk;
+    // batch_read(chunk);
+
     var start: usize = 0;
-    const chunk_size = measurements.len / morsel_count;
-    for (0..morsel_count) |i| {
+    const chunk_size = measurements.len / MORSEL_COUNT;
+    for (0..MORSEL_COUNT) |i| {
         var end = @min(measurements.len, start + chunk_size);
         const wut = std.mem.indexOfScalar(u8, measurements[end..], '\n') orelse 0;
 
@@ -57,17 +62,17 @@ pub fn main(init: std.process.Init) !void {
 
     // std.debug.print("measuments size: {d} | morsels are: {any}\n", .{ measurements.len, morsels });
 
-    var threads: [thread_count]std.Thread = undefined;
-    var maps: [thread_count]std.StringArrayHashMapUnmanaged(Stats) = undefined;
+    var threads: [THREAD_COUNT]std.Thread = undefined;
+    var maps: [THREAD_COUNT]std.StringArrayHashMapUnmanaged(Stats) = undefined;
 
-    for (0..thread_count) |i| {
+    for (0..THREAD_COUNT) |i| {
         maps[i] = .empty;
         try maps[i].ensureTotalCapacity(arena, 10000);
         threads[i] = try std.Thread.spawn(.{}, process, .{ arena, &maps[i], measurements });
     }
 
     // join threads and merge the maps into big map
-    for (0..thread_count) |i| {
+    for (0..THREAD_COUNT) |i| {
         threads[i].join();
 
         var iterator = maps[i].iterator();
@@ -162,6 +167,9 @@ fn parseTemperatureFast(text: []const u8, semicolon: usize) i64 {
         fraction +
         @as(i64, @intCast(has_two_integers)) * 100 *
             potentially_hundreth;
+
+    const next_semicolon: u64 = decimal_bit + 2;
+    _ = next_semicolon;
     return ret * (1 - 2 * @as(i64, @intCast(is_neg)));
 }
 
@@ -183,62 +191,98 @@ fn process(
 ) !void {
     while (true) {
         // get the morsel
-        const idx = morsel_ready_idx.fetchAdd(1, .monotonic);
-        if (idx >= morsel_count) {
+        const morsel_idx = morsel_ready_idx.fetchAdd(1, .monotonic);
+        if (morsel_idx >= MORSEL_COUNT) {
             break;
         }
 
-        const morsel = morsels[idx];
+        const morsel = morsels[morsel_idx];
+        var chunk_idx: usize = morsel.start;
 
-        var it = std.mem.splitScalar(u8, measurements[morsel.start..morsel.end], '\n');
+        while (chunk_idx < morsel.end) {
+            const chunk = measurements[chunk_idx..][0..RAW_CHUNK_SIZE];
+            const chars: @Vector(RAW_CHUNK_SIZE, u8) = chunk.*;
 
-        while (it.next()) |line| {
-            if (line.len == 0) break;
-            const station, const temperature_bytes = std.mem.cutScalar(u8, line, ';').?;
-            // const temperature = parseTemperature(temperature_bytes);
-            var temperature: i64 = undefined;
-            const semicolon = @intFromPtr(temperature_bytes.ptr) -
-                @intFromPtr(measurements.ptr) - 1;
-            if (semicolon <= measurements.len - 9) {
-                @branchHint(.likely);
-                temperature = parseTemperatureFast(measurements, semicolon);
-            } else {
-                temperature = parseTemperature(temperature_bytes);
+            var semicolons: u64 = @bitCast(
+                chars == @as(@Vector(RAW_CHUNK_SIZE, u8), @splat(';')),
+            );
+
+            while (semicolons > 0) {
+                const idx: usize = @ctz(semicolons);
+                const station: []u8 = measurements[chunk_idx..][0..idx];
+                const temperature = parseTemperatureFast(measurements, chunk_idx + idx);
+
+                const result = try map.getOrPut(arena, station);
+                const val = result.value_ptr;
+
+                if (result.found_existing) {
+                    val.count += 1;
+                    val.sum += temperature;
+                    val.max = @max(val.max, temperature);
+                    val.min = @min(val.min, temperature);
+                } else {
+                    result.key_ptr.* = station;
+                    val.* = .{ .count = 1, .min = temperature, .max = temperature, .sum = temperature };
+                }
+
+                semicolons &= semicolons - 1;
+                std.debug.assert(chunk[idx] == ';');
             }
-            const result = try map.getOrPut(arena, station);
-            const val = result.value_ptr;
-
-            if (result.found_existing) {
-                val.count += 1;
-                val.sum += temperature;
-                val.max = @max(val.max, temperature);
-                val.min = @min(val.min, temperature);
-            } else {
-                result.key_ptr.* = station;
-                val.* = .{ .count = 1, .min = temperature, .max = temperature, .sum = temperature };
-            }
+            chunk_idx += RAW_CHUNK_SIZE;
         }
+
+        // var it = std.mem.splitScalar(u8, measurements[morsel.start..morsel.end], '\n');
+
+        // while (it.next()) |line| {
+        //     if (line.len == 0) break;
+        //     const station, const temperature_bytes = std.mem.cutScalar(u8, line, ';').?;
+        //     // const temperature = parseTemperature(temperature_bytes);
+        //     var temperature: i64 = undefined;
+        //     const semicolon = @intFromPtr(temperature_bytes.ptr) -
+        //         @intFromPtr(measurements.ptr) - 1;
+        //     if (semicolon <= measurements.len - 9) {
+        //         @branchHint(.likely);
+        //         temperature = parseTemperatureFast(measurements, semicolon);
+        //     } else {
+        //         temperature = parseTemperature(temperature_bytes);
+        //     }
+        // const result = try map.getOrPut(arena, station);
+        // const val = result.value_ptr;
+
+        // if (result.found_existing) {
+        //     val.count += 1;
+        //     val.sum += temperature;
+        //     val.max = @max(val.max, temperature);
+        //     val.min = @min(val.min, temperature);
+        // } else {
+        //     result.key_ptr.* = station;
+        //     val.* = .{ .count = 1, .min = temperature, .max = temperature, .sum = temperature };
+        // }
+        // }
     }
 }
 
-fn parseTemperatureFast_old(text: []const u8, semicolon: usize) i64 {
-    const ayo = text[semicolon + 1 ..][0..8];
-    const num = std.mem.readInt(u64, ayo, .little);
-    const decimal_bit: u64 = @as(u64, @intCast(@ctz(~num & 0x10101000))) >> 3;
-    const is_neg = (~num >> 4) & 1;
-    const has_two_integers = (decimal_bit - is_neg - 1);
-    const ret: i64 =
-        @as(i64, ayo[decimal_bit - 1] - '0') * 10 +
-        @as(i64, ayo[decimal_bit + 1] - '0') +
-        @as(i64, @intCast(has_two_integers)) * 100 *
-            @as(i64, ayo[is_neg] - '0');
-    return ret * (1 - 2 * @as(i64, @intCast(is_neg)));
+/// this thing basically gets a 64 byte chunk, it then just returns a batch of rows:
+/// [row1][row2]...
+/// [Niigata;15.6][Niigata;15.6]...
+/// Niigata;15.6\nNiiguata;15.6\n
+///        ^              ^
+fn batch_read(chunk: *[RAW_CHUNK_SIZE]u8) void {
+    // let's find the ';'s first, interesting
+    const chars: @Vector(RAW_CHUNK_SIZE, u8) = chunk.*;
+    var semicolons: u64 = @bitCast(
+        chars == @as(@Vector(RAW_CHUNK_SIZE, u8), @splat(';')),
+    );
+
+    while (semicolons > 0) {
+        const idx: usize = @ctz(semicolons);
+        std.debug.print("found pos: {}\n", .{idx});
+        semicolons &= semicolons - 1;
+        std.debug.assert(chunk[idx] == ';');
+    }
 }
-// how the hell do we merge those maps darn it
-// just be a brute
 
-// so the whole game plan is that we:
-// - basically pre determine morsel boundaries
-// - then just let threads consume them at their own pace
-
-// now we need the merge logic so we can use multiple threads
+// okay, wtf are we doing here ?
+// we can figure out the darn ;s in a 64 byte slice
+// and a morsel is just a byte range
+// so just do a darn loop and do shit
