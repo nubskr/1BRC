@@ -152,7 +152,7 @@ test "does this work?" {
     try std.testing.expectEqual(our_hash, verification_hash);
 }
 
-fn parseTemperatureFast(text: []const u8, semicolon: usize) i64 {
+fn parseTemperatureFast(text: []const u8, semicolon: usize, next_station: *u64) i64 {
     const ayo = text[semicolon + 1 ..][0..8];
     const num = std.mem.readInt(u64, ayo, .little);
     // get location for '.'
@@ -168,8 +168,9 @@ fn parseTemperatureFast(text: []const u8, semicolon: usize) i64 {
         @as(i64, @intCast(has_two_integers)) * 100 *
             potentially_hundreth;
 
-    const next_semicolon: u64 = decimal_bit + 2;
-    _ = next_semicolon;
+    // next_station.* = decimal_bit + 3;
+    next_station.* = semicolon + decimal_bit + 4;
+    // _ = next_semicolon;
     return ret * (1 - 2 * @as(i64, @intCast(is_neg)));
 }
 
@@ -199,36 +200,69 @@ fn process(
         const morsel = morsels[morsel_idx];
         var chunk_idx: usize = morsel.start;
 
+        var station_start_idx: u64 = morsel.start;
         while (chunk_idx < morsel.end) {
-            const chunk = measurements[chunk_idx..][0..RAW_CHUNK_SIZE];
-            const chars: @Vector(RAW_CHUNK_SIZE, u8) = chunk.*;
+            if (chunk_idx + RAW_CHUNK_SIZE < morsel.end) {
+                @branchHint(.likely);
+                const chunk = measurements[chunk_idx..][0..RAW_CHUNK_SIZE];
+                const chars: @Vector(RAW_CHUNK_SIZE, u8) = chunk.*;
 
-            var semicolons: u64 = @bitCast(
-                chars == @as(@Vector(RAW_CHUNK_SIZE, u8), @splat(';')),
-            );
+                var semicolons: u64 = @bitCast(
+                    chars == @as(@Vector(RAW_CHUNK_SIZE, u8), @splat(';')),
+                );
 
-            while (semicolons > 0) {
-                const idx: usize = @ctz(semicolons);
-                const station: []u8 = measurements[chunk_idx..][0..idx];
-                const temperature = parseTemperatureFast(measurements, chunk_idx + idx);
+                while (semicolons > 0) {
+                    const idx: usize = @ctz(semicolons);
+                    const station: []u8 = measurements[station_start_idx .. chunk_idx + idx];
+                    const temperature = parseTemperatureFast(measurements, chunk_idx + idx, &station_start_idx);
 
-                const result = try map.getOrPut(arena, station);
-                const val = result.value_ptr;
+                    const result = try map.getOrPut(arena, station);
+                    const val = result.value_ptr;
 
-                if (result.found_existing) {
-                    val.count += 1;
-                    val.sum += temperature;
-                    val.max = @max(val.max, temperature);
-                    val.min = @min(val.min, temperature);
-                } else {
-                    result.key_ptr.* = station;
-                    val.* = .{ .count = 1, .min = temperature, .max = temperature, .sum = temperature };
+                    // the below part is probably fine
+                    if (result.found_existing) {
+                        val.count += 1;
+                        val.sum += temperature;
+                        val.max = @max(val.max, temperature);
+                        val.min = @min(val.min, temperature);
+                    } else {
+                        result.key_ptr.* = station;
+                        val.* = .{ .count = 1, .min = temperature, .max = temperature, .sum = temperature };
+                    }
+
+                    semicolons &= semicolons - 1;
+                    std.debug.assert(chunk[idx] == ';');
                 }
+                chunk_idx += RAW_CHUNK_SIZE;
+            } else {
+                const tail = measurements[@min(station_start_idx, morsel.end)..morsel.end];
+                // do something I guess
 
-                semicolons &= semicolons - 1;
-                std.debug.assert(chunk[idx] == ';');
+                // so this is the last part of the morsel and its smaller than 64 bytes, what can we do ?
+
+                var it = std.mem.splitScalar(u8, tail, '\n');
+
+                while (it.next()) |line| {
+                    if (line.len == 0) break;
+                    const station, const temperature_bytes = std.mem.cutScalar(u8, line, ';') orelse break;
+                    // const temperature = parseTemperature(temperature_bytes);
+                    var temperature: i64 = undefined;
+                    temperature = parseTemperature(temperature_bytes);
+                    const result = try map.getOrPut(arena, station);
+                    const val = result.value_ptr;
+
+                    if (result.found_existing) {
+                        val.count += 1;
+                        val.sum += temperature;
+                        val.max = @max(val.max, temperature);
+                        val.min = @min(val.min, temperature);
+                    } else {
+                        result.key_ptr.* = station;
+                        val.* = .{ .count = 1, .min = temperature, .max = temperature, .sum = temperature };
+                    }
+                }
+                chunk_idx = morsel.end;
             }
-            chunk_idx += RAW_CHUNK_SIZE;
         }
 
         // var it = std.mem.splitScalar(u8, measurements[morsel.start..morsel.end], '\n');
