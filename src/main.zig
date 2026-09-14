@@ -11,12 +11,14 @@ const Stats = struct {
     count: i64,
 };
 
+const MAP_SLOTS: usize = (1 << 8);
 const MORSEL_COUNT: usize = 56;
 const THREAD_COUNT: usize = 16;
 const RAW_CHUNK_SIZE: usize = 64;
 
 var morsels: [MORSEL_COUNT]Morsel = undefined;
 var morsel_ready_idx = std.atomic.Value(usize).init(0);
+var signature_tracker: std.AutoHashMap(u32, []const u8) = undefined;
 
 const Morsel = struct { start: usize, end: usize };
 
@@ -25,6 +27,10 @@ const Morsel = struct { start: usize, end: usize };
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const arena = init.arena.allocator();
+    // @memset(&signature_tracker, 0);
+
+    signature_tracker = std.AutoHashMap(u32, []const u8).init(arena);
+    defer signature_tracker.deinit();
 
     var map: std.StringArrayHashMapUnmanaged(Stats) = .empty;
     try map.ensureTotalCapacity(arena, 10000);
@@ -125,6 +131,8 @@ pub fn main(init: std.process.Init) !void {
     }
     try writer_interface.writeAll("}\n");
     try writer_interface.flush();
+
+    std.debug.print("\nunique station count: {d}", .{map.count()});
 }
 
 test "does this work?" {
@@ -152,7 +160,7 @@ test "does this work?" {
     try std.testing.expectEqual(our_hash, verification_hash);
 }
 
-fn parseTemperatureFast(text: []const u8, semicolon: usize, next_station: *u64) i64 {
+inline fn parseTemperatureFast(text: []const u8, semicolon: usize, next_station: *u64) i64 {
     const ayo = text[semicolon + 1 ..][0..8];
     const num = std.mem.readInt(u64, ayo, .little);
     // get location for '.'
@@ -174,7 +182,7 @@ fn parseTemperatureFast(text: []const u8, semicolon: usize, next_station: *u64) 
     return ret * (1 - 2 * @as(i64, @intCast(is_neg)));
 }
 
-fn parseTemperature(text: []const u8) i64 {
+inline fn parseTemperature(text: []const u8) i64 {
     const is_neg: usize = @intFromBool(text[0] == '-');
     const has_two_integers: i64 = @intFromBool(text.len - is_neg == 4);
     const ret: i64 = @as(i64, @as(i64, (text[text.len - 1] - '0') + 10 * @as(i64, (text[text.len - 3] - '0'))) + has_two_integers * 100 * @as(i64, (text[is_neg] - '0')));
@@ -184,7 +192,7 @@ fn parseTemperature(text: []const u8) i64 {
 
 /// okay, so what does this guy needs ?
 /// each core needs its own map
-/// so: map,measurements, morsel
+/// so: map,measurements,alloc
 fn process(
     arena: std.mem.Allocator,
     map: *std.StringArrayHashMapUnmanaged(Stats),
@@ -214,6 +222,7 @@ fn process(
                 while (semicolons > 0) {
                     const idx: usize = @ctz(semicolons);
                     const station: []u8 = measurements[station_start_idx .. chunk_idx + idx];
+                    try log_signature(station);
                     const temperature = parseTemperatureFast(measurements, chunk_idx + idx, &station_start_idx);
 
                     const result = try map.getOrPut(arena, station);
@@ -245,6 +254,7 @@ fn process(
                 while (it.next()) |line| {
                     if (line.len == 0) break;
                     const station, const temperature_bytes = std.mem.cutScalar(u8, line, ';') orelse break;
+                    try log_signature(station);
                     // const temperature = parseTemperature(temperature_bytes);
                     var temperature: i64 = undefined;
                     temperature = parseTemperature(temperature_bytes);
@@ -264,35 +274,6 @@ fn process(
                 chunk_idx = morsel.end;
             }
         }
-
-        // var it = std.mem.splitScalar(u8, measurements[morsel.start..morsel.end], '\n');
-
-        // while (it.next()) |line| {
-        //     if (line.len == 0) break;
-        //     const station, const temperature_bytes = std.mem.cutScalar(u8, line, ';').?;
-        //     // const temperature = parseTemperature(temperature_bytes);
-        //     var temperature: i64 = undefined;
-        //     const semicolon = @intFromPtr(temperature_bytes.ptr) -
-        //         @intFromPtr(measurements.ptr) - 1;
-        //     if (semicolon <= measurements.len - 9) {
-        //         @branchHint(.likely);
-        //         temperature = parseTemperatureFast(measurements, semicolon);
-        //     } else {
-        //         temperature = parseTemperature(temperature_bytes);
-        //     }
-        // const result = try map.getOrPut(arena, station);
-        // const val = result.value_ptr;
-
-        // if (result.found_existing) {
-        //     val.count += 1;
-        //     val.sum += temperature;
-        //     val.max = @max(val.max, temperature);
-        //     val.min = @min(val.min, temperature);
-        // } else {
-        //     result.key_ptr.* = station;
-        //     val.* = .{ .count = 1, .min = temperature, .max = temperature, .sum = temperature };
-        // }
-        // }
     }
 }
 
@@ -316,7 +297,29 @@ fn batch_read(chunk: *[RAW_CHUNK_SIZE]u8) void {
     }
 }
 
-// okay, wtf are we doing here ?
-// we can figure out the darn ;s in a 64 byte slice
-// and a morsel is just a byte range
-// so just do a darn loop and do shit
+// okay, so now hashing is the expensive part, ~70% of time is going there, how to make it cheap
+// can we get unique data by doing this stuff ?
+fn log_signature(data: []const u8) !void {
+    const const_len = 4;
+    var signature: u32 = 0;
+    if (data.len >= const_len) {
+        const first = std.mem.readInt(u32, data[0..const_len], .little);
+        const last = std.mem.readInt(
+            u32,
+            data[data.len - const_len ..][0..const_len],
+            .little,
+        );
+        signature = first +% last;
+    } else {
+        // idk man, lol, let it be I guess
+        signature = std.mem.readVarInt(u32, data, .little);
+    }
+
+    if (signature_tracker.get(signature)) |old_station| {
+        if (!std.mem.eql(u8, old_station, data))
+            @panic("signature collision");
+    } else {
+        try signature_tracker.put(signature, data);
+    }
+    // signature_tracker[signature] += 1;
+}
