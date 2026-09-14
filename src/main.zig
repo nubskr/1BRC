@@ -12,14 +12,13 @@ const Stats = struct {
 };
 
 const MAP_SLOTS: usize = (1 << 13);
-const MIXING_MAGIC = 364691192;
+const MIXING_MAGIC: u32 = 3646911923;
 const MORSEL_COUNT: usize = 56;
 const THREAD_COUNT: usize = 16;
 const RAW_CHUNK_SIZE: usize = 64;
 
 var morsels: [MORSEL_COUNT]Morsel = undefined;
 var morsel_ready_idx = std.atomic.Value(usize).init(0);
-var signature_tracker: std.AutoHashMap(u32, []const u8) = undefined;
 
 const Morsel = struct { start: usize, end: usize };
 
@@ -28,11 +27,6 @@ const Morsel = struct { start: usize, end: usize };
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const arena = init.arena.allocator();
-    // @memset(&signature_tracker, 0);
-
-    signature_tracker = std.AutoHashMap(u32, []const u8).init(arena);
-    defer signature_tracker.deinit();
-
     var map: std.StringArrayHashMapUnmanaged(Stats) = .empty;
     try map.ensureTotalCapacity(arena, 10000);
 
@@ -70,32 +64,29 @@ pub fn main(init: std.process.Init) !void {
     // std.debug.print("measuments size: {d} | morsels are: {any}\n", .{ measurements.len, morsels });
 
     var threads: [THREAD_COUNT]std.Thread = undefined;
-    var maps: [THREAD_COUNT]std.StringArrayHashMapUnmanaged(Stats) = undefined;
+    var maps: [THREAD_COUNT]*my_map = undefined;
 
     for (0..THREAD_COUNT) |i| {
-        maps[i] = .empty;
-        try maps[i].ensureTotalCapacity(arena, 10000);
-        threads[i] = try std.Thread.spawn(.{}, process, .{ arena, &maps[i], measurements });
+        maps[i] = try my_map.init(arena);
+        threads[i] = try std.Thread.spawn(.{}, process, .{ arena, maps[i], measurements });
     }
 
     // join threads and merge the maps into big map
     for (0..THREAD_COUNT) |i| {
         threads[i].join();
 
-        var iterator = maps[i].iterator();
-
-        while (iterator.next()) |entry| {
-            const idk = try map.getOrPut(arena, entry.key_ptr.*);
+        for (&maps[i].slots) |*entry| {
+            if (entry.key.len == 0) continue;
+            const idk = try map.getOrPut(arena, entry.key);
 
             if (idk.found_existing) {
-                const my_value = entry.value_ptr.*;
                 const val = idk.value_ptr;
-                val.count += my_value.count;
-                val.sum += my_value.sum;
-                val.max = @max(val.max, my_value.max);
-                val.min = @min(val.min, my_value.min);
+                val.count += entry.value.count;
+                val.sum += entry.value.sum;
+                val.max = @max(val.max, entry.value.max);
+                val.min = @min(val.min, entry.value.min);
             } else {
-                idk.value_ptr.* = entry.value_ptr.*;
+                idk.value_ptr.* = entry.value;
             }
         }
     }
@@ -134,8 +125,6 @@ pub fn main(init: std.process.Init) !void {
     try writer_interface.flush();
 
     std.debug.print("\nunique station count: {d}", .{map.count()});
-
-    try brute_boi(map);
 }
 
 test "does this work?" {
@@ -198,7 +187,7 @@ inline fn parseTemperature(text: []const u8) i64 {
 /// so: map,measurements,alloc
 fn process(
     arena: std.mem.Allocator,
-    map: *std.StringArrayHashMapUnmanaged(Stats),
+    map: *my_map,
     measurements: []u8,
 ) !void {
     while (true) {
@@ -225,7 +214,6 @@ fn process(
                 while (semicolons > 0) {
                     const idx: usize = @ctz(semicolons);
                     const station: []u8 = measurements[station_start_idx .. chunk_idx + idx];
-                    _ = try get_signature(station);
                     const temperature = parseTemperatureFast(measurements, chunk_idx + idx, &station_start_idx);
 
                     const result = try map.getOrPut(arena, station);
@@ -257,7 +245,6 @@ fn process(
                 while (it.next()) |line| {
                     if (line.len == 0) break;
                     const station, const temperature_bytes = std.mem.cutScalar(u8, line, ';') orelse break;
-                    _ = try get_signature(station);
                     // const temperature = parseTemperature(temperature_bytes);
                     var temperature: i64 = undefined;
                     temperature = parseTemperature(temperature_bytes);
@@ -302,7 +289,7 @@ fn batch_read(chunk: *[RAW_CHUNK_SIZE]u8) void {
 
 // okay, so now hashing is the expensive part, ~70% of time is going there, how to make it cheap
 // can we get unique data by doing this stuff ?
-fn get_signature(data: []const u8) !u32 {
+inline fn get_signature(data: []const u8) u32 {
     const const_len = 4;
     var signature: u32 = 0;
     if (data.len >= const_len) {
@@ -316,13 +303,6 @@ fn get_signature(data: []const u8) !u32 {
     } else {
         // idk man, lol, let it be I guess
         signature = std.mem.readVarInt(u32, data, .little);
-    }
-
-    if (signature_tracker.get(signature)) |old_station| {
-        if (!std.mem.eql(u8, old_station, data))
-            @panic("signature collision");
-    } else {
-        try signature_tracker.put(signature, data);
     }
 
     return signature;
@@ -350,7 +330,7 @@ fn brute_boi(stations_map: std.StringArrayHashMapUnmanaged(Stats)) !void {
             while (iterator.next()) |entry| {
                 const name = entry.key_ptr.*;
 
-                const signature = try get_signature(name);
+                const signature = get_signature(name);
 
                 const slot: usize = @intCast(
                     (signature *% magic) >> @intCast(32 - bits),
@@ -379,54 +359,40 @@ fn brute_boi(stations_map: std.StringArrayHashMapUnmanaged(Stats)) !void {
 // so hash state size: 2^13
 // magic num: 3646911923
 
-fn get_station_idx(station_name: []const u8) !u32 {
-    return ((try get_signature(station_name) *% MIXING_MAGIC) >> 19);
+inline fn get_station_idx(station_name: []const u8) usize {
+    return (get_signature(station_name) *% MIXING_MAGIC) >> 19;
 }
 
-const map_value = struct {
-    count: u64,
-    max: u64,
-    min: u64,
-    sum: u64,
+const map_slot = struct {
+    key: []const u8 = "",
+    value: Stats = .{ .count = 0, .min = 0, .max = 0, .sum = 0 },
 };
 
 const map_result = struct {
     key_ptr: *[]const u8,
-    value_ptr: *map_value,
-    _gop_counter: u64,
+    value_ptr: *Stats,
     found_existing: bool,
 };
 
 const my_map = struct {
-    slots: [MAP_SLOTS]map_result,
+    slots: [MAP_SLOTS]map_slot,
 
-    fn init(allocator: std.mem.Allocator) *my_map {
-        const self = try allocator.create(my_map, MAP_SLOTS);
-        self.* = .{
-            .slots = .{.{ .key_ptr = null, .value_ptr = null, ._gop_counter = 0, .found_existing = false }} ** MAP_SLOTS,
-        };
+    fn init(allocator: std.mem.Allocator) !*my_map {
+        const self = try allocator.create(my_map);
+        self.* = .{ .slots = @splat(.{}) };
 
         return self;
     }
 
     // guaranteed no key collisions for this dataset btw
-    fn getOrPut(self: *my_map, allocator: std.mem.Allocator, key: []const u8) !map_result {
+    inline fn getOrPut(self: *my_map, allocator: std.mem.Allocator, key: []const u8) !map_result {
         _ = allocator; // this is just so that we can keep the original map functions intact
 
-        const idx = try get_station_idx(key);
-
-        const idk = self.slots[idx];
-
-        idk._gop_counter += 1;
-
-        // how and where the hell do I turn this flag on ?
-        // so I think there are two parts of this ? have another thing for when the keys are used first ?
-        if (!idk.found_existing) {
-            idk.key_ptr.* = key;
-        }
-
-        idk.found_existing = idk._gop_counter > 1;
-
-        return self.slots[idx];
+        const slot = &self.slots[get_station_idx(key)];
+        return .{
+            .key_ptr = &slot.key,
+            .value_ptr = &slot.value,
+            .found_existing = slot.key.len != 0,
+        };
     }
 };
