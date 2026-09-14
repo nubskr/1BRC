@@ -11,7 +11,8 @@ const Stats = struct {
     count: i64,
 };
 
-const MAP_SLOTS: usize = (1 << 8);
+const MAP_SLOTS: usize = (1 << 13);
+const MIXING_MAGIC = 364691192;
 const MORSEL_COUNT: usize = 56;
 const THREAD_COUNT: usize = 16;
 const RAW_CHUNK_SIZE: usize = 64;
@@ -133,6 +134,8 @@ pub fn main(init: std.process.Init) !void {
     try writer_interface.flush();
 
     std.debug.print("\nunique station count: {d}", .{map.count()});
+
+    try brute_boi(map);
 }
 
 test "does this work?" {
@@ -222,7 +225,7 @@ fn process(
                 while (semicolons > 0) {
                     const idx: usize = @ctz(semicolons);
                     const station: []u8 = measurements[station_start_idx .. chunk_idx + idx];
-                    try log_signature(station);
+                    _ = try get_signature(station);
                     const temperature = parseTemperatureFast(measurements, chunk_idx + idx, &station_start_idx);
 
                     const result = try map.getOrPut(arena, station);
@@ -254,7 +257,7 @@ fn process(
                 while (it.next()) |line| {
                     if (line.len == 0) break;
                     const station, const temperature_bytes = std.mem.cutScalar(u8, line, ';') orelse break;
-                    try log_signature(station);
+                    _ = try get_signature(station);
                     // const temperature = parseTemperature(temperature_bytes);
                     var temperature: i64 = undefined;
                     temperature = parseTemperature(temperature_bytes);
@@ -299,7 +302,7 @@ fn batch_read(chunk: *[RAW_CHUNK_SIZE]u8) void {
 
 // okay, so now hashing is the expensive part, ~70% of time is going there, how to make it cheap
 // can we get unique data by doing this stuff ?
-fn log_signature(data: []const u8) !void {
+fn get_signature(data: []const u8) !u32 {
     const const_len = 4;
     var signature: u32 = 0;
     if (data.len >= const_len) {
@@ -321,5 +324,109 @@ fn log_signature(data: []const u8) !void {
     } else {
         try signature_tracker.put(signature, data);
     }
-    // signature_tracker[signature] += 1;
+
+    return signature;
 }
+
+// so at this point we know we can fit it in 32 bits, but 2^32 is 32gb, that would blow up per thread, we need to be able to compress it more\
+// how much can we compress the hash state without causing collisions, it should basically be a power of 2 to to have performant map ops
+// something like (raw_signature * SOME_MAGIC_NUM ) & (COMPRESSED_STATE_SIZE - 1), assuming COMPRESSED_STATE_SIZE is a power of 2
+// so we need to find those two magic constants such that no collisions occur, a nested loop should do since its a one time thing
+// outer loop can just be till 32, internal loop would be bigger, I'm hoping somethign exists which satisfies our needs
+// we can just run this for unique station names
+// small optimization: higher X bits are more influenced by avalanche effect, so use that
+fn brute_boi(stations_map: std.StringArrayHashMapUnmanaged(Stats)) !void {
+    for (9..14) |bits| {
+        const slots: usize = @as(usize, 1) << @intCast(bits);
+
+        var magic: u32 = 1;
+
+        while (magic != 0) : (magic +%= 2) {
+            var used: [8192]bool = @splat(false);
+
+            var collision = false;
+
+            var iterator = stations_map.iterator();
+            while (iterator.next()) |entry| {
+                const name = entry.key_ptr.*;
+
+                const signature = try get_signature(name);
+
+                const slot: usize = @intCast(
+                    (signature *% magic) >> @intCast(32 - bits),
+                );
+
+                if (used[slot]) {
+                    collision = true;
+                    break;
+                }
+
+                used[slot] = true;
+            }
+
+            if (!collision) {
+                std.debug.print(
+                    "FOUND: slots={} bits={} magic={}\n",
+                    .{ slots, bits, magic },
+                );
+                return;
+            }
+        }
+    }
+}
+
+// brute force results: FOUND: slots=8192 bits=13 magic=3646911923
+// so hash state size: 2^13
+// magic num: 3646911923
+
+fn get_station_idx(station_name: []const u8) !u32 {
+    return ((try get_signature(station_name) *% MIXING_MAGIC) >> 19);
+}
+
+const map_value = struct {
+    count: u64,
+    max: u64,
+    min: u64,
+    sum: u64,
+};
+
+const map_result = struct {
+    key_ptr: *[]const u8,
+    value_ptr: *map_value,
+    _gop_counter: u64,
+    found_existing: bool,
+};
+
+const my_map = struct {
+    slots: [MAP_SLOTS]map_result,
+
+    fn init(allocator: std.mem.Allocator) *my_map {
+        const self = try allocator.create(my_map, MAP_SLOTS);
+        self.* = .{
+            .slots = .{.{ .key_ptr = null, .value_ptr = null, ._gop_counter = 0, .found_existing = false }} ** MAP_SLOTS,
+        };
+
+        return self;
+    }
+
+    // guaranteed no key collisions for this dataset btw
+    fn getOrPut(self: *my_map, allocator: std.mem.Allocator, key: []const u8) !map_result {
+        _ = allocator; // this is just so that we can keep the original map functions intact
+
+        const idx = try get_station_idx(key);
+
+        const idk = self.slots[idx];
+
+        idk._gop_counter += 1;
+
+        // how and where the hell do I turn this flag on ?
+        // so I think there are two parts of this ? have another thing for when the keys are used first ?
+        if (!idk.found_existing) {
+            idk.key_ptr.* = key;
+        }
+
+        idk.found_existing = idk._gop_counter > 1;
+
+        return self.slots[idx];
+    }
+};
