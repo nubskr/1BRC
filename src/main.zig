@@ -13,6 +13,8 @@ const Stats = struct {
 
 const MAP_SLOTS: usize = (1 << 13);
 const MIXING_MAGIC: u32 = 3646911923;
+const EXPECTED_STATIONS: usize = 413;
+const MAX_STATION_BYTES: usize = EXPECTED_STATIONS * 100;
 const MORSEL_COUNT: usize = 56;
 const THREAD_COUNT: usize = 16;
 const RAW_CHUNK_SIZE: usize = 64;
@@ -68,20 +70,15 @@ pub fn main(init: std.process.Init) !void {
 
     for (0..THREAD_COUNT) |i| {
         maps[i] = try StationsTable.init(arena);
-        threads[i] = try std.Thread.spawn(.{}, process, .{ arena, maps[i], measurements });
+        threads[i] = try std.Thread.spawn(.{}, process, .{ maps[i], measurements });
     }
 
     // join threads and merge the maps into big map
     for (0..THREAD_COUNT) |i| {
         threads[i].join();
 
-        // TODO: we need to kinda do something about this garbage I guess
-        for (&maps[i]) |entry| {
-            const station_name = entry.station_names_idx;
-
-            const stats_idx = get_station_idx(station_name);
-            const stats = entry.stats_buf[stats_idx];
-
+        const station_count: usize = maps[i].station_count;
+        for (maps[i].station_names_idx[0..station_count], maps[i].stats_buf[0..station_count]) |station_name, stats| {
             const idk = try map.getOrPut(arena, station_name);
 
             if (idk.found_existing) {
@@ -191,11 +188,9 @@ inline fn parseTemperature(text: []const u8) i64 {
 /// each core needs its own map
 /// so: map,measurements,alloc
 fn process(
-    arena: std.mem.Allocator,
     map: *StationsTable,
     measurements: []u8,
 ) !void {
-    _ = arena;
     while (true) {
         // get the morsel
         const morsel_idx = morsel_ready_idx.fetchAdd(1, .monotonic);
@@ -222,7 +217,7 @@ fn process(
                     const station: []u8 = measurements[station_start_idx .. chunk_idx + idx];
                     const temperature = parseTemperatureFast(measurements, chunk_idx + idx, &station_start_idx);
 
-                    try map.add(station, temperature);
+                    map.add(station, temperature);
 
                     semicolons &= semicolons - 1;
                     std.debug.assert(chunk[idx] == ';');
@@ -240,7 +235,7 @@ fn process(
                     // const temperature = parseTemperature(temperature_bytes);
                     var temperature: i64 = undefined;
                     temperature = parseTemperature(temperature_bytes);
-                    try map.add(station, temperature);
+                    map.add(station, temperature);
                 }
                 chunk_idx = morsel.end;
             }
@@ -379,53 +374,52 @@ const my_map = struct {
 };
 
 const StationsTable = struct {
-    // TODO: rearrange for tighter packing later
     station_idx: [MAP_SLOTS]u16, // this points the signature -> station_idx
-    free_station_idx: u16,
-    stations_buf: [MAP_SLOTS * 110]u8, // this is the actual packed buffer containing the station bytes
-    stats_buf: [MAP_SLOTS]Stats, // same as above but stores stats on same idx instead
-    station_names_idx: [500][]const u8, // the only use of this is to basically make it easier to merge all tables in the end
+    station_count: u16,
+    name_bytes_used: u32,
+    stations_buf: [MAX_STATION_BYTES]u8,
+    stats_buf: [EXPECTED_STATIONS]Stats,
+    station_names_idx: [EXPECTED_STATIONS][]const u8,
 
     fn init(allocator: std.mem.Allocator) !*StationsTable {
         const self = try allocator.create(StationsTable);
 
-        self.* = .{
-            .station_idx = std.math.maxInt(u16) ** MAP_SLOTS,
-            .stations_buf = @splat(.{}),
-            .stats_buf = @splat(.{}),
-            .station_names_idx = @splat(.{}),
-            .free_station_idx = 0,
-        };
+        self.station_idx = @splat(std.math.maxInt(u16));
+        self.station_count = 0;
+        self.name_bytes_used = 0;
+        return self;
     }
 
     fn deinit(self: *StationsTable, allocator: std.mem.Allocator) void {
-        allocator.free(&self);
+        allocator.destroy(self);
     }
 
-    fn add(self: *StationsTable, key: []const u8, temperature: i64) void {
-        var idx = &self.station_idx[get_station_idx(key)];
+    inline fn add(self: *StationsTable, key: []const u8, temperature: i64) void {
+        const slot = get_station_idx(key);
+        const station = self.station_idx[slot];
 
-        if (idx != std.math.maxInt(u16)) {
+        if (station != std.math.maxInt(u16)) {
             @branchHint(.likely);
-            // basically things are already there, so we just have to update shit
-            // get the stats and update
-            var val = self.stats_buf[idx];
+            const val = &self.stats_buf[station];
             val.count += 1;
             val.sum += temperature;
             val.max = @max(val.max, temperature);
             val.min = @min(val.min, temperature);
         } else {
-            // this branch will only be taken about 450ish times per thread, that's nothing
+            const new_station = self.station_count;
+            self.station_count += 1;
+            self.station_idx[slot] = new_station;
 
-            // create new, everything default
-            std.debug.assert(idx == std.math.maxInt(u16));
-            idx = self.free_station_idx;
-            self.stats_buf[idx] = .{ .min = std.math.maxInt(u64), .sum = 0, .max = std.math.minInt(u64), .count = 0 };
-            @memcpy(self.stations_buf[self.free_station_idx .. self.free_station_idx + key.len], key.ptr);
-            self.station_names_idx[self.free_station_idx] = &self.stations_buf[self.free_station_idx .. self.free_station_idx + key.len];
-            self.free_station_idx += key.len;
+            const name_start = self.name_bytes_used;
+            self.name_bytes_used += @intCast(key.len);
+            @memcpy(self.stations_buf[name_start..self.name_bytes_used], key);
+            self.station_names_idx[new_station] = self.stations_buf[name_start..self.name_bytes_used];
+            self.stats_buf[new_station] = .{
+                .count = 1,
+                .sum = temperature,
+                .min = temperature,
+                .max = temperature,
+            };
         }
     }
 };
-
-// brooo how do I make an fucking iterator interface, fuck this shit, arghhhhh
