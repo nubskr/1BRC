@@ -64,10 +64,10 @@ pub fn main(init: std.process.Init) !void {
     // std.debug.print("measuments size: {d} | morsels are: {any}\n", .{ measurements.len, morsels });
 
     var threads: [THREAD_COUNT]std.Thread = undefined;
-    var maps: [THREAD_COUNT]*my_map = undefined;
+    var maps: [THREAD_COUNT]*StationsTable = undefined;
 
     for (0..THREAD_COUNT) |i| {
-        maps[i] = try my_map.init(arena);
+        maps[i] = try StationsTable.init(arena);
         threads[i] = try std.Thread.spawn(.{}, process, .{ arena, maps[i], measurements });
     }
 
@@ -75,18 +75,23 @@ pub fn main(init: std.process.Init) !void {
     for (0..THREAD_COUNT) |i| {
         threads[i].join();
 
-        for (&maps[i].slots) |*entry| {
-            if (entry.key.len == 0) continue;
-            const idk = try map.getOrPut(arena, entry.key);
+        // TODO: we need to kinda do something about this garbage I guess
+        for (&maps[i]) |entry| {
+            const station_name = entry.station_names_idx;
+
+            const stats_idx = get_station_idx(station_name);
+            const stats = entry.stats_buf[stats_idx];
+
+            const idk = try map.getOrPut(arena, station_name);
 
             if (idk.found_existing) {
                 const val = idk.value_ptr;
-                val.count += entry.value.count;
-                val.sum += entry.value.sum;
-                val.max = @max(val.max, entry.value.max);
-                val.min = @min(val.min, entry.value.min);
+                val.count += stats.count;
+                val.sum += stats.sum;
+                val.max = @max(val.max, stats.max);
+                val.min = @min(val.min, stats.min);
             } else {
-                idk.value_ptr.* = entry.value;
+                idk.value_ptr.* = stats;
             }
         }
     }
@@ -187,9 +192,10 @@ inline fn parseTemperature(text: []const u8) i64 {
 /// so: map,measurements,alloc
 fn process(
     arena: std.mem.Allocator,
-    map: *my_map,
+    map: *StationsTable,
     measurements: []u8,
 ) !void {
+    _ = arena;
     while (true) {
         // get the morsel
         const morsel_idx = morsel_ready_idx.fetchAdd(1, .monotonic);
@@ -216,19 +222,7 @@ fn process(
                     const station: []u8 = measurements[station_start_idx .. chunk_idx + idx];
                     const temperature = parseTemperatureFast(measurements, chunk_idx + idx, &station_start_idx);
 
-                    const result = try map.getOrPut(arena, station);
-                    const val = result.value_ptr;
-
-                    // the below part is probably fine
-                    if (result.found_existing) {
-                        val.count += 1;
-                        val.sum += temperature;
-                        val.max = @max(val.max, temperature);
-                        val.min = @min(val.min, temperature);
-                    } else {
-                        result.key_ptr.* = station;
-                        val.* = .{ .count = 1, .min = temperature, .max = temperature, .sum = temperature };
-                    }
+                    try map.add(station, temperature);
 
                     semicolons &= semicolons - 1;
                     std.debug.assert(chunk[idx] == ';');
@@ -236,8 +230,6 @@ fn process(
                 chunk_idx += RAW_CHUNK_SIZE;
             } else {
                 const tail = measurements[@min(station_start_idx, morsel.end)..morsel.end];
-                // do something I guess
-
                 // so this is the last part of the morsel and its smaller than 64 bytes, what can we do ?
 
                 var it = std.mem.splitScalar(u8, tail, '\n');
@@ -248,18 +240,7 @@ fn process(
                     // const temperature = parseTemperature(temperature_bytes);
                     var temperature: i64 = undefined;
                     temperature = parseTemperature(temperature_bytes);
-                    const result = try map.getOrPut(arena, station);
-                    const val = result.value_ptr;
-
-                    if (result.found_existing) {
-                        val.count += 1;
-                        val.sum += temperature;
-                        val.max = @max(val.max, temperature);
-                        val.min = @min(val.min, temperature);
-                    } else {
-                        result.key_ptr.* = station;
-                        val.* = .{ .count = 1, .min = temperature, .max = temperature, .sum = temperature };
-                    }
+                    try map.add(station, temperature);
                 }
                 chunk_idx = morsel.end;
             }
@@ -396,3 +377,55 @@ const my_map = struct {
         };
     }
 };
+
+const StationsTable = struct {
+    // TODO: rearrange for tighter packing later
+    station_idx: [MAP_SLOTS]u16, // this points the signature -> station_idx
+    free_station_idx: u16,
+    stations_buf: [MAP_SLOTS * 110]u8, // this is the actual packed buffer containing the station bytes
+    stats_buf: [MAP_SLOTS]Stats, // same as above but stores stats on same idx instead
+    station_names_idx: [500][]const u8, // the only use of this is to basically make it easier to merge all tables in the end
+
+    fn init(allocator: std.mem.Allocator) !*StationsTable {
+        const self = try allocator.create(StationsTable);
+
+        self.* = .{
+            .station_idx = std.math.maxInt(u16) ** MAP_SLOTS,
+            .stations_buf = @splat(.{}),
+            .stats_buf = @splat(.{}),
+            .station_names_idx = @splat(.{}),
+            .free_station_idx = 0,
+        };
+    }
+
+    fn deinit(self: *StationsTable, allocator: std.mem.Allocator) void {
+        allocator.free(&self);
+    }
+
+    fn add(self: *StationsTable, key: []const u8, temperature: i64) void {
+        var idx = &self.station_idx[get_station_idx(key)];
+
+        if (idx != std.math.maxInt(u16)) {
+            @branchHint(.likely);
+            // basically things are already there, so we just have to update shit
+            // get the stats and update
+            var val = self.stats_buf[idx];
+            val.count += 1;
+            val.sum += temperature;
+            val.max = @max(val.max, temperature);
+            val.min = @min(val.min, temperature);
+        } else {
+            // this branch will only be taken about 450ish times per thread, that's nothing
+
+            // create new, everything default
+            std.debug.assert(idx == std.math.maxInt(u16));
+            idx = self.free_station_idx;
+            self.stats_buf[idx] = .{ .min = std.math.maxInt(u64), .sum = 0, .max = std.math.minInt(u64), .count = 0 };
+            @memcpy(self.stations_buf[self.free_station_idx .. self.free_station_idx + key.len], key.ptr);
+            self.station_names_idx[self.free_station_idx] = &self.stations_buf[self.free_station_idx .. self.free_station_idx + key.len];
+            self.free_station_idx += key.len;
+        }
+    }
+};
+
+// brooo how do I make an fucking iterator interface, fuck this shit, arghhhhh
