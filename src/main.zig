@@ -5,10 +5,10 @@ const _1brc = @import("1brc");
 const measurements_path = "./measurements.txt";
 
 const Stats = struct {
-    min: i64,
     sum: i64,
-    max: i64,
-    count: i64,
+    count: u32,
+    min: i16,
+    max: i16,
 };
 
 const MAP_SLOTS: usize = (1 << 13);
@@ -446,10 +446,11 @@ const StationsTable = struct {
         if (known or station != std.math.maxInt(u16)) {
             @branchHint(.likely);
             const val = &self.stats_buf[station];
+            const temperature16: i16 = @intCast(temperature);
             val.count += 1;
             val.sum += temperature;
-            val.max = @max(val.max, temperature);
-            val.min = @min(val.min, temperature);
+            val.max = @max(val.max, temperature16);
+            val.min = @min(val.min, temperature16);
         } else {
             const new_station = self.station_count;
             self.station_count += 1;
@@ -462,8 +463,8 @@ const StationsTable = struct {
             self.stats_buf[new_station] = .{
                 .count = 1,
                 .sum = temperature,
-                .min = temperature,
-                .max = temperature,
+                .min = @intCast(temperature),
+                .max = @intCast(temperature),
             };
         }
 
