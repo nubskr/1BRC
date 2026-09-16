@@ -30,7 +30,7 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const arena = init.arena.allocator();
     var map: std.StringArrayHashMapUnmanaged(Stats) = .empty;
-    try map.ensureTotalCapacity(arena, 10000);
+    try map.ensureTotalCapacity(arena, 500);
 
     const file = try Io.Dir.cwd().openFile(io, measurements_path, .{});
     defer file.close(io);
@@ -201,8 +201,14 @@ fn process(
         const morsel = morsels[morsel_idx];
         var chunk_idx: usize = morsel.start;
 
+        // first loop finds all stations, second one does the rest in a branchless way
+        // how exactly do you expect it figure it out then ?
+        // let's make map.add return the size of the map as well lel
+
+        var found_stations: u16 = 0;
+
         var station_start_idx: u64 = morsel.start;
-        while (chunk_idx < morsel.end) {
+        while (chunk_idx < morsel.end and found_stations < EXPECTED_STATIONS) {
             if (chunk_idx + RAW_CHUNK_SIZE < morsel.end) {
                 @branchHint(.likely);
                 const chunk = measurements[chunk_idx..][0..RAW_CHUNK_SIZE];
@@ -217,7 +223,7 @@ fn process(
                     const station: []u8 = measurements[station_start_idx .. chunk_idx + idx];
                     const temperature = parseTemperatureFast(measurements, chunk_idx + idx, &station_start_idx);
 
-                    map.add(station, temperature);
+                    found_stations = map.add(station, temperature, false);
 
                     semicolons &= semicolons - 1;
                     std.debug.assert(chunk[idx] == ';');
@@ -235,7 +241,47 @@ fn process(
                     // const temperature = parseTemperature(temperature_bytes);
                     var temperature: i64 = undefined;
                     temperature = parseTemperature(temperature_bytes);
-                    map.add(station, temperature);
+                    found_stations = map.add(station, temperature, false);
+                }
+                chunk_idx = morsel.end;
+            }
+        }
+
+        // var station_start_idx: u64 = morsel.start;
+        while (chunk_idx < morsel.end) {
+            if (chunk_idx + RAW_CHUNK_SIZE < morsel.end) {
+                @branchHint(.likely);
+                const chunk = measurements[chunk_idx..][0..RAW_CHUNK_SIZE];
+                const chars: @Vector(RAW_CHUNK_SIZE, u8) = chunk.*;
+
+                var semicolons: u64 = @bitCast(
+                    chars == @as(@Vector(RAW_CHUNK_SIZE, u8), @splat(';')),
+                );
+
+                while (semicolons > 0) {
+                    const idx: usize = @ctz(semicolons);
+                    const station: []u8 = measurements[station_start_idx .. chunk_idx + idx];
+                    const temperature = parseTemperatureFast(measurements, chunk_idx + idx, &station_start_idx);
+
+                    _ = map.add(station, temperature, true);
+
+                    semicolons &= semicolons - 1;
+                    std.debug.assert(chunk[idx] == ';');
+                }
+                chunk_idx += RAW_CHUNK_SIZE;
+            } else {
+                const tail = measurements[@min(station_start_idx, morsel.end)..morsel.end];
+                // so this is the last part of the morsel and its smaller than 64 bytes, what can we do ?
+
+                var it = std.mem.splitScalar(u8, tail, '\n');
+
+                while (it.next()) |line| {
+                    if (line.len == 0) break;
+                    const station, const temperature_bytes = std.mem.cutScalar(u8, line, ';') orelse break;
+                    // const temperature = parseTemperature(temperature_bytes);
+                    var temperature: i64 = undefined;
+                    temperature = parseTemperature(temperature_bytes);
+                    _ = map.add(station, temperature, true);
                 }
                 chunk_idx = morsel.end;
             }
@@ -383,7 +429,6 @@ const StationsTable = struct {
 
     fn init(allocator: std.mem.Allocator) !*StationsTable {
         const self = try allocator.create(StationsTable);
-
         self.station_idx = @splat(std.math.maxInt(u16));
         self.station_count = 0;
         self.name_bytes_used = 0;
@@ -394,11 +439,11 @@ const StationsTable = struct {
         allocator.destroy(self);
     }
 
-    inline fn add(self: *StationsTable, key: []const u8, temperature: i64) void {
+    inline fn add(self: *StationsTable, key: []const u8, temperature: i64, comptime known: bool) u16 {
         const slot = get_station_idx(key);
         const station = self.station_idx[slot];
 
-        if (station != std.math.maxInt(u16)) {
+        if (known or station != std.math.maxInt(u16)) {
             @branchHint(.likely);
             const val = &self.stats_buf[station];
             val.count += 1;
@@ -421,5 +466,7 @@ const StationsTable = struct {
                 .max = temperature,
             };
         }
+
+        return self.station_count;
     }
 };
