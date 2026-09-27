@@ -15,7 +15,7 @@ const MAP_SLOTS: usize = (1 << 13);
 const MIXING_MAGIC: u32 = 3646911923;
 const EXPECTED_STATIONS: usize = 413;
 const MAX_STATION_BYTES: usize = EXPECTED_STATIONS * 100;
-const MORSEL_COUNT: usize = 56;
+const MORSEL_COUNT: usize = THREAD_COUNT * 16;
 const THREAD_COUNT: usize = 16;
 const RAW_CHUNK_SIZE: usize = 64;
 
@@ -44,7 +44,8 @@ pub fn main(init: std.process.Init) !void {
         file.handle,
         0,
     );
-    defer std.posix.munmap(measurements);
+    // exiting removes mappings anyway
+    // defer std.posix.munmap(measurements);
 
     const chunk = measurements[0..RAW_CHUNK_SIZE];
     _ = chunk;
